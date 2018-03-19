@@ -87,13 +87,14 @@ func (exp *explorerUI) Blocks(w http.ResponseWriter, r *http.Request) {
 // Block is the page handler for the "/block" path
 func (exp *explorerUI) Block(w http.ResponseWriter, r *http.Request) {
 	hash := getBlockHashCtx(r)
-
+	
 	data := exp.blockData.GetExplorerBlock(hash)
 	if data == nil {
 		log.Errorf("Unable to get block %s", hash)
 		exp.ErrorPage(w, "Something went wrong...", "could not find that block", true)
 		return
 	}
+	
 	// Checking if there exists any regular non-Coinbase transactions in the block.
 	var count int
 	data.TxAvailable = true
@@ -113,7 +114,12 @@ func (exp *explorerUI) Block(w http.ResponseWriter, r *http.Request) {
 			log.Warnf("Unable to retrieve missed votes for block %s: %v", hash, err)
 		}
 	}
-
+	
+	if exp.NewBlockData == nil {
+		exp.ErrorPage(w, "Syncing block data...", "BlockData not yet ready, please wait...", false)
+		return
+	}
+	
 	pageData := struct {
 		Data          *BlockInfo
 		ConfirmHeight int64
@@ -123,6 +129,7 @@ func (exp *explorerUI) Block(w http.ResponseWriter, r *http.Request) {
 		exp.NewBlockData.Height - data.Confirmations,
 		exp.Version,
 	}
+	
 	str, err := exp.templates.execTemplateToString("block", pageData)
 	if err != nil {
 		log.Errorf("Template execute failure: %v", err)

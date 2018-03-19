@@ -80,6 +80,8 @@ func mainCore() error {
 	if err != nil || dcrdClient == nil {
 		return fmt.Errorf("Connection to dcrd failed: %v", err)
 	}
+	
+	log.Infof("Connected to dcrd succesfully.")
 
 	defer func() {
 		// Closing these channels should be unnecessary if quit was handled right
@@ -93,12 +95,15 @@ func mainCore() error {
 		log.Infof("Bye!")
 		time.Sleep(250 * time.Millisecond)
 	}()
+	
+	log.Infof("Retreiving current network for json-rpc.")
 
 	// Display connected network
 	curnet, err := dcrdClient.GetCurrentNet()
 	if err != nil {
 		return fmt.Errorf("Unable to get current network from dcrd: %v", err)
 	}
+	
 	log.Infof("Connected to dcrd (JSON-RPC API v%s) on %v",
 		nodeVer.String(), curnet.String())
 
@@ -280,6 +285,99 @@ func mainCore() error {
 	defer explore.StopMempoolMonitor(ntfnChans.expNewTxChan)
 
 	blockDataSavers = append(blockDataSavers, explore)
+	
+	// WaitGroup for the monitor goroutines
+	var wg sync.WaitGroup
+	
+	// Start web API
+	app := newContext(dcrdClient, &baseDB, cfg.IndentJSON)
+	
+	// Start notification hander to keep /status up-to-date
+	wg.Add(1)
+	go app.StatusNtfnHandler(&wg, quit)
+	
+	// Initial setting of db_height. Subsequently, Store() will send this.
+	ntfnChans.updateStatusDBHeight <- uint32(baseDB.GetHeight())
+	
+	// Blockchain monitor for the collector
+	addrMap := make(map[string]txhelpers.TxAction) // for support of watched addresses
+	// On reorg, only update web UI since dcrsqlite's own reorg handler will
+	// deal with patching up the block info database.
+	reorgBlockDataSavers := []blockdata.BlockDataSaver{explore}
+	wsChainMonitor := blockdata.NewChainMonitor(collector, blockDataSavers,
+		reorgBlockDataSavers, quit, &wg, addrMap,
+		ntfnChans.connectChan, ntfnChans.recvTxBlockChan,
+		ntfnChans.reorgChanBlockData)
+	
+	// Blockchain monitor for the stake DB
+	sdbChainMonitor := baseDB.NewStakeDBChainMonitor(quit, &wg,
+		ntfnChans.connectChanStakeDB, ntfnChans.reorgChanStakeDB)
+	
+	// Blockchain monitor for the wired sqlite DB
+	wiredDBChainMonitor := baseDB.NewChainMonitor(collector, quit, &wg,
+		ntfnChans.connectChanWiredDB, ntfnChans.reorgChanWiredDB)
+	
+	// Setup the synchronous handler functions called by the collectionQueue via
+	// OnBlockConnected.
+	collectionQueue.SetSynchronousHandlers([]func(*chainhash.Hash){
+		sdbChainMonitor.BlockConnectedSync,     // 1. Stake DB for pool info
+		wsChainMonitor.BlockConnectedSync,      // 2. blockdata for regular block data collection and storage
+		wiredDBChainMonitor.BlockConnectedSync, // 3. dcrsqlite for sqlite DB reorg handling
+	})
+	
+	// Initial data summary for web ui. stakedb must be at the same height, so
+	// we get do this before starting the monitors.
+	blockData, _, err := collector.Collect()
+	if err != nil {
+		return fmt.Errorf("Block data collection for initial summary failed: %v",
+			err.Error())
+	}
+	if err = explore.Store(blockData, nil); err != nil {
+		return fmt.Errorf("Failed to store initial block data for explorer pages: %v", err.Error())
+	}
+	
+	explore.StartMempoolMonitor(ntfnChans.expNewTxChan)
+	
+	apiMux := newAPIRouter(app, cfg.UseRealIP)
+	
+	webMux := chi.NewRouter()
+	webMux.Get("/", explore.Home)
+	webMux.Get("/ws", explore.RootWebsocket)
+	webMux.Get("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "./public/images/favicon.ico")
+	})
+	cacheControlMaxAge := int64(cfg.CacheControlMaxAge)
+	FileServer(webMux, "/js", http.Dir("./public/js"), cacheControlMaxAge)
+	FileServer(webMux, "/css", http.Dir("./public/css"), cacheControlMaxAge)
+	FileServer(webMux, "/fonts", http.Dir("./public/fonts"), cacheControlMaxAge)
+	FileServer(webMux, "/images", http.Dir("./public/images"), cacheControlMaxAge)
+	webMux.NotFound(explore.NotFound)
+	webMux.Mount("/api", apiMux.Mux)
+	
+	webMux.Mount("/explorer", explore.Mux)
+	webMux.Get("/blocks", explore.Blocks)
+	webMux.Get("/mempool", explore.Mempool)
+	webMux.With(explore.BlockHashPathOrIndexCtx).Get("/block/{blockhash}", explore.Block)
+	webMux.With(explorer.TransactionHashCtx).Get("/tx/{txid}", explore.TxPage)
+	webMux.With(explorer.AddressPathCtx).Get("/address/{address}", explore.AddressPage)
+	webMux.Get("/decodetx", explore.DecodeTxPage)
+	webMux.Get("/search", explore.Search)
+	
+	// HTTP profiler
+	if cfg.HTTPProfile {
+		profPath := cfg.HTTPProfPath
+		log.Warnf("Starting the HTTP profiler on path %s.", profPath)
+		// http pprof uses http.DefaultServeMux
+		http.Handle("/", http.RedirectHandler(profPath+"/debug/pprof/", http.StatusSeeOther))
+		webMux.Mount(profPath, http.StripPrefix(profPath, http.DefaultServeMux))
+	}
+	
+	log.Infof("Creating http api %s@%s", cfg.APIProto,cfg.APIListen)
+	if err = listenAndServeProto(cfg.APIListen, cfg.APIProto, webMux); err != nil {
+		log.Criticalf("listenAndServeProto: %v", err)
+		//close(quit)
+		return err
+	}
 
 	// Sync up with the blockchain
 	getSyncd := func(updateAddys, updateVotes, newPGInds bool,
@@ -342,47 +440,7 @@ func mainCore() error {
 	}
 	// now create and start the monitors that respond to the notification chans
 
-	// WaitGroup for the monitor goroutines
-	var wg sync.WaitGroup
 
-	// Blockchain monitor for the collector
-	addrMap := make(map[string]txhelpers.TxAction) // for support of watched addresses
-	// On reorg, only update web UI since dcrsqlite's own reorg handler will
-	// deal with patching up the block info database.
-	reorgBlockDataSavers := []blockdata.BlockDataSaver{explore}
-	wsChainMonitor := blockdata.NewChainMonitor(collector, blockDataSavers,
-		reorgBlockDataSavers, quit, &wg, addrMap,
-		ntfnChans.connectChan, ntfnChans.recvTxBlockChan,
-		ntfnChans.reorgChanBlockData)
-
-	// Blockchain monitor for the stake DB
-	sdbChainMonitor := baseDB.NewStakeDBChainMonitor(quit, &wg,
-		ntfnChans.connectChanStakeDB, ntfnChans.reorgChanStakeDB)
-
-	// Blockchain monitor for the wired sqlite DB
-	wiredDBChainMonitor := baseDB.NewChainMonitor(collector, quit, &wg,
-		ntfnChans.connectChanWiredDB, ntfnChans.reorgChanWiredDB)
-
-	// Setup the synchronous handler functions called by the collectionQueue via
-	// OnBlockConnected.
-	collectionQueue.SetSynchronousHandlers([]func(*chainhash.Hash){
-		sdbChainMonitor.BlockConnectedSync,     // 1. Stake DB for pool info
-		wsChainMonitor.BlockConnectedSync,      // 2. blockdata for regular block data collection and storage
-		wiredDBChainMonitor.BlockConnectedSync, // 3. dcrsqlite for sqlite DB reorg handling
-	})
-
-	// Initial data summary for web ui. stakedb must be at the same height, so
-	// we get do this before starting the monitors.
-	blockData, _, err := collector.Collect()
-	if err != nil {
-		return fmt.Errorf("Block data collection for initial summary failed: %v",
-			err.Error())
-	}
-	if err = explore.Store(blockData, nil); err != nil {
-		return fmt.Errorf("Failed to store initial block data for explorer pages: %v", err.Error())
-	}
-
-	explore.StartMempoolMonitor(ntfnChans.expNewTxChan)
 
 	// blockdata collector
 	wg.Add(2)
@@ -444,52 +502,6 @@ func mainCore() error {
 	default:
 	}
 
-	// Start web API
-	app := newContext(dcrdClient, &baseDB, cfg.IndentJSON)
-	// Start notification hander to keep /status up-to-date
-	wg.Add(1)
-	go app.StatusNtfnHandler(&wg, quit)
-	// Initial setting of db_height. Subsequently, Store() will send this.
-	ntfnChans.updateStatusDBHeight <- uint32(baseDB.GetHeight())
-
-	apiMux := newAPIRouter(app, cfg.UseRealIP)
-
-	webMux := chi.NewRouter()
-	webMux.Get("/", explore.Home)
-	webMux.Get("/ws", explore.RootWebsocket)
-	webMux.Get("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "./public/images/favicon.ico")
-	})
-	cacheControlMaxAge := int64(cfg.CacheControlMaxAge)
-	FileServer(webMux, "/js", http.Dir("./public/js"), cacheControlMaxAge)
-	FileServer(webMux, "/css", http.Dir("./public/css"), cacheControlMaxAge)
-	FileServer(webMux, "/fonts", http.Dir("./public/fonts"), cacheControlMaxAge)
-	FileServer(webMux, "/images", http.Dir("./public/images"), cacheControlMaxAge)
-	webMux.NotFound(explore.NotFound)
-	webMux.Mount("/api", apiMux.Mux)
-
-	webMux.Mount("/explorer", explore.Mux)
-	webMux.Get("/blocks", explore.Blocks)
-	webMux.Get("/mempool", explore.Mempool)
-	webMux.With(explore.BlockHashPathOrIndexCtx).Get("/block/{blockhash}", explore.Block)
-	webMux.With(explorer.TransactionHashCtx).Get("/tx/{txid}", explore.TxPage)
-	webMux.With(explorer.AddressPathCtx).Get("/address/{address}", explore.AddressPage)
-	webMux.Get("/decodetx", explore.DecodeTxPage)
-	webMux.Get("/search", explore.Search)
-
-	// HTTP profiler
-	if cfg.HTTPProfile {
-		profPath := cfg.HTTPProfPath
-		log.Warnf("Starting the HTTP profiler on path %s.", profPath)
-		// http pprof uses http.DefaultServeMux
-		http.Handle("/", http.RedirectHandler(profPath+"/debug/pprof/", http.StatusSeeOther))
-		webMux.Mount(profPath, http.StripPrefix(profPath, http.DefaultServeMux))
-	}
-
-	if err = listenAndServeProto(cfg.APIListen, cfg.APIProto, webMux); err != nil {
-		log.Criticalf("listenAndServeProto: %v", err)
-		close(quit)
-	}
 
 	// Wait for notification handlers to quit
 	wg.Wait()
